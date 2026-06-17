@@ -6,7 +6,8 @@ use clock::ReplicaId;
 use cloud_api_types::{
     CreateLlmTokenResponse, EditPredictionTrigger, LlmToken, Organization,
     OrganizationConfiguration, OrganizationEditPredictionConfiguration, OrganizationId,
-    SubmitEditPredictionSettledBody, SubmitEditPredictionSettledResponse,
+    SubmitEditPredictionSettledBatchBody, SubmitEditPredictionSettledBody,
+    SubmitEditPredictionSettledResponse,
 };
 use cloud_llm_client::{
     EditPredictionRejectReason, EditPredictionRejection, PredictEditsRequestTrigger,
@@ -2995,8 +2996,11 @@ fn init_test_with_fake_client_and_legacy_data_collection(
                             } else {
                                 buf
                             };
-                            let req = serde_json::from_slice(&body).unwrap();
-                            settled_req_tx.unbounded_send(req).unwrap();
+                            let req: SubmitEditPredictionSettledBatchBody =
+                                serde_json::from_slice(&body).unwrap();
+                            for prediction in req.predictions {
+                                settled_req_tx.unbounded_send(prediction).unwrap();
+                            }
                             serde_json::to_string(&SubmitEditPredictionSettledResponse {}).unwrap()
                         }
                         _ => {
@@ -4022,19 +4026,6 @@ const MIT_LICENSE: &str = indoc! {r#"
     SOFTWARE.
 "#};
 
-fn empty_captured_context() -> CapturedPredictionContext {
-    CapturedPredictionContext {
-        repository_url: None,
-        revision: None,
-        uncommitted_diff: None,
-        buffer_diagnostics: Vec::new(),
-    }
-}
-
-fn numbered_lines(count: u32) -> String {
-    (0..count).map(|ix| format!("line {ix}\n")).collect()
-}
-
 async fn init_sample_capture_test(
     tree: serde_json::Value,
     cx: &mut TestAppContext,
@@ -4060,28 +4051,6 @@ async fn init_sample_capture_test(
     });
     cx.run_until_parked();
     (ep_store, requests, project, buffer)
-}
-
-fn prompt_history_boundary(
-    ep_store: &Entity<EditPredictionStore>,
-    project: &Entity<Project>,
-    cx: &mut TestAppContext,
-) -> PromptHistoryBoundary {
-    ep_store.update(cx, |ep_store, _cx| {
-        let project_state = ep_store.projects.get(&project.entity_id()).unwrap();
-        PromptHistoryBoundary {
-            first_event_seq: project_state
-                .last_event
-                .as_ref()
-                .map_or(project_state.next_last_event_seq, |last_event| {
-                    last_event.seq
-                }),
-            snapshot: project_state
-                .last_event
-                .as_ref()
-                .map(|last_event| last_event.new_snapshot.clone()),
-        }
-    })
 }
 
 /// Enqueues a settled prediction capture with injected sample data, as the
@@ -4147,7 +4116,7 @@ async fn test_edit_prediction_settled_sends_sample_data_after_quiescence(cx: &mu
     let (ep_store, mut requests, project, buffer) = init_sample_capture_test(
         json!({
             "LICENSE": MIT_LICENSE,
-            "foo.md": numbered_lines(60),
+            "foo.md": (0..60).map(|ix| format!("line {ix}\n")).collect::<String>(),
         }),
         cx,
     )
@@ -4159,7 +4128,21 @@ async fn test_edit_prediction_settled_sends_sample_data_after_quiescence(cx: &mu
     });
     cx.run_until_parked();
 
-    let boundary = prompt_history_boundary(&ep_store, &project, cx);
+    let boundary = ep_store.update(cx, |ep_store, _cx| {
+        let project_state = ep_store.projects.get(&project.entity_id()).unwrap();
+        PromptHistoryBoundary {
+            first_event_seq: project_state
+                .last_event
+                .as_ref()
+                .map_or(project_state.next_last_event_seq, |last_event| {
+                    last_event.seq
+                }),
+            snapshot: project_state
+                .last_event
+                .as_ref()
+                .map(|last_event| last_event.new_snapshot.clone()),
+        }
+    });
     let editable_offset_range = enqueue_sample_capture(
         &ep_store,
         &project,
@@ -4190,14 +4173,33 @@ async fn test_edit_prediction_settled_sends_sample_data_after_quiescence(cx: &mu
 
     // A second capture whose user has data collection disabled; its sample
     // and settled region must be redacted at send time.
-    let boundary = prompt_history_boundary(&ep_store, &project, cx);
+    let boundary = ep_store.update(cx, |ep_store, _cx| {
+        let project_state = ep_store.projects.get(&project.entity_id()).unwrap();
+        PromptHistoryBoundary {
+            first_event_seq: project_state
+                .last_event
+                .as_ref()
+                .map_or(project_state.next_last_event_seq, |last_event| {
+                    last_event.seq
+                }),
+            snapshot: project_state
+                .last_event
+                .as_ref()
+                .map(|last_event| last_event.new_snapshot.clone()),
+        }
+    });
     enqueue_sample_capture(
         &ep_store,
         &project,
         &buffer,
         "prediction-redacted",
         Point::new(2, 0)..Point::new(3, 0),
-        empty_captured_context(),
+        CapturedPredictionContext {
+            repository_url: None,
+            revision: None,
+            uncommitted_diff: None,
+            buffer_diagnostics: Vec::new(),
+        },
         Some(boundary),
         VecDeque::new(),
         cx,
@@ -4299,15 +4301,36 @@ async fn test_edit_prediction_settled_sample_data_requires_observing_all_events_
     let (ep_store, mut requests, project, buffer) = init_sample_capture_test(
         json!({
             "LICENSE": MIT_LICENSE,
-            "foo.md": numbered_lines(30),
+            "foo.md": (0..30).map(|ix| format!("line {ix}\n")).collect::<String>(),
         }),
         cx,
     )
     .await;
 
     // Two predictions are requested while no event is pending.
-    let boundary_observed = prompt_history_boundary(&ep_store, &project, cx);
-    let boundary_missed = prompt_history_boundary(&ep_store, &project, cx);
+    let (boundary_observed, boundary_missed) = ep_store.update(cx, |ep_store, _cx| {
+        let project_state = ep_store.projects.get(&project.entity_id()).unwrap();
+        let first_event_seq = project_state
+            .last_event
+            .as_ref()
+            .map_or(project_state.next_last_event_seq, |last_event| {
+                last_event.seq
+            });
+        let snapshot = project_state
+            .last_event
+            .as_ref()
+            .map(|last_event| last_event.new_snapshot.clone());
+        (
+            PromptHistoryBoundary {
+                first_event_seq,
+                snapshot: snapshot.clone(),
+            },
+            PromptHistoryBoundary {
+                first_event_seq,
+                snapshot,
+            },
+        )
+    });
     assert!(boundary_observed.snapshot.is_none());
 
     // The first capture is enqueued immediately, so it observes both
@@ -4318,7 +4341,12 @@ async fn test_edit_prediction_settled_sample_data_requires_observing_all_events_
         &buffer,
         "prediction-observed",
         Point::new(1, 0)..Point::new(2, 0),
-        empty_captured_context(),
+        CapturedPredictionContext {
+            repository_url: None,
+            revision: None,
+            uncommitted_diff: None,
+            buffer_diagnostics: Vec::new(),
+        },
         Some(boundary_observed),
         VecDeque::new(),
         cx,
@@ -4344,7 +4372,12 @@ async fn test_edit_prediction_settled_sample_data_requires_observing_all_events_
         &buffer,
         "prediction-missed",
         Point::new(1, 0)..Point::new(2, 0),
-        empty_captured_context(),
+        CapturedPredictionContext {
+            repository_url: None,
+            revision: None,
+            uncommitted_diff: None,
+            buffer_diagnostics: Vec::new(),
+        },
         Some(boundary_missed),
         VecDeque::new(),
         cx,
@@ -4380,8 +4413,11 @@ async fn test_edit_prediction_settled_sample_data_requires_observing_all_events_
 async fn test_edit_prediction_settled_drops_future_events_when_their_oss_status_is_unknown(
     cx: &mut TestAppContext,
 ) {
-    let (ep_store, mut requests, project, buffer) =
-        init_sample_capture_test(json!({ "foo.md": numbered_lines(30) }), cx).await;
+    let (ep_store, mut requests, project, buffer) = init_sample_capture_test(
+        json!({ "foo.md": (0..30).map(|ix| format!("line {ix}\n")).collect::<String>() }),
+        cx,
+    )
+    .await;
 
     enqueue_sample_capture(
         &ep_store,
@@ -4389,7 +4425,12 @@ async fn test_edit_prediction_settled_drops_future_events_when_their_oss_status_
         &buffer,
         "prediction-non-oss",
         Point::new(1, 0)..Point::new(2, 0),
-        empty_captured_context(),
+        CapturedPredictionContext {
+            repository_url: None,
+            revision: None,
+            uncommitted_diff: None,
+            buffer_diagnostics: Vec::new(),
+        },
         None,
         VecDeque::new(),
         cx,
