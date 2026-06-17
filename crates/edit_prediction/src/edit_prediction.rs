@@ -49,7 +49,7 @@ use language::{
 use project::{DisableAiSettings, Project, ProjectPath, WorktreeId};
 use release_channel::AppVersion;
 use semver::Version;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use settings::{
     EditPredictionDataCollectionChoice, EditPredictionProvider, Settings as _, update_settings_file,
 };
