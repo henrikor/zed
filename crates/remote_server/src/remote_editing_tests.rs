@@ -782,6 +782,202 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_remote_code_lens_and_code_action_resolve(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code"),
+        json!({
+            "project1": {
+                ".git": {},
+                "src": {
+                    "lib.rs": "fn one() -> usize { 1 }"
+                }
+            },
+        }),
+    )
+    .await;
+
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+
+    let capabilities = lsp::ServerCapabilities {
+        code_lens_provider: Some(lsp::CodeLensOptions {
+            resolve_provider: Some(true),
+        }),
+        code_action_provider: Some(lsp::CodeActionProviderCapability::Options(
+            lsp::CodeActionOptions {
+                resolve_provider: Some(true),
+                ..lsp::CodeActionOptions::default()
+            },
+        )),
+        ..lsp::ServerCapabilities::default()
+    };
+
+    cx.update_entity(&project, |project, _| {
+        project.languages().register_test_language(LanguageConfig {
+            name: "Rust".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["rs".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        project.languages().register_fake_lsp_adapter(
+            "Rust",
+            FakeLspAdapter {
+                name: "rust-analyzer",
+                capabilities: capabilities.clone(),
+                ..FakeLspAdapter::default()
+            },
+        );
+    });
+
+    let mut fake_lsp = server_cx.update(|cx| {
+        headless.read(cx).languages.register_fake_lsp_server(
+            LanguageServerName("rust-analyzer".into()),
+            capabilities,
+            None,
+        )
+    });
+
+    cx.run_until_parked();
+
+    let worktree_id = project
+        .update(cx, |project, cx| {
+            project.languages().add(rust_lang());
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap()
+        .0
+        .read_with(cx, |worktree, _| worktree.id());
+    cx.run_until_parked();
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_buffer_with_lsp((worktree_id, rel_path("src/lib.rs")), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let fake_lsp = fake_lsp.next().await.unwrap();
+
+    // Code lens: the server returns an unresolved lens (no command) that must be
+    // resolved through the host to get its title.
+    fake_lsp.set_request_handler::<lsp::request::CodeLensRequest, _, _>(|_, _| async move {
+        Ok(Some(vec![lsp::CodeLens {
+            range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 9)),
+            command: None,
+            data: Some(serde_json::json!({ "id": "lens" })),
+        }]))
+    });
+    fake_lsp.set_request_handler::<lsp::request::CodeLensResolve, _, _>(|lens, _| async move {
+        assert!(
+            lens.command.is_none(),
+            "Host should receive the unresolved lens to resolve"
+        );
+        Ok(lsp::CodeLens {
+            command: Some(lsp::Command {
+                title: "1 reference".to_string(),
+                command: "noop".to_string(),
+                arguments: None,
+            }),
+            ..lens
+        })
+    });
+
+    let range = buffer.read_with(cx, |buffer, _| {
+        let anchor = buffer.snapshot().anchor_before(0);
+        anchor..anchor
+    });
+    let lens_actions = project
+        .update(cx, |project, cx| {
+            project.code_lens_actions(&buffer, range, cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lens_actions.len(),
+        1,
+        "Should have fetched one code lens action, but got: {lens_actions:?}"
+    );
+    assert_eq!(
+        lens_actions[0].lsp_action.title(),
+        "1 reference",
+        "Remote code lens should be resolved through the host"
+    );
+
+    // Code action: the server returns an unresolved action (no edit) that the
+    // host resolves into a workspace edit through the same generic plumbing.
+    fake_lsp.set_request_handler::<lsp::request::CodeActionRequest, _, _>(|_, _| async move {
+        Ok(Some(vec![lsp::CodeActionOrCommand::CodeAction(
+            lsp::CodeAction {
+                title: "Use two".to_string(),
+                data: Some(serde_json::json!({ "id": "action" })),
+                ..lsp::CodeAction::default()
+            },
+        )]))
+    });
+    fake_lsp.set_request_handler::<lsp::request::CodeActionResolveRequest, _, _>(
+        |mut action, _| async move {
+            assert!(
+                action.edit.is_none(),
+                "Host should receive the unresolved action to resolve"
+            );
+            action.edit = Some(lsp::WorkspaceEdit {
+                changes: Some(
+                    [(
+                        lsp::Uri::from_file_path(path!("/code/project1/src/lib.rs")).unwrap(),
+                        vec![lsp::TextEdit::new(
+                            lsp::Range::new(lsp::Position::new(0, 3), lsp::Position::new(0, 6)),
+                            "two".to_string(),
+                        )],
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..lsp::WorkspaceEdit::default()
+            });
+            Ok(action)
+        },
+    );
+
+    let actions = project
+        .update(cx, |project, cx| {
+            project.code_actions(&buffer, 0..0, None, cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actions.len(),
+        1,
+        "Should have fetched one code action, but got: {actions:?}"
+    );
+    assert!(
+        actions[0].lsp_action.edit().is_none(),
+        "Fetched action should be unresolved"
+    );
+
+    let resolved = project
+        .update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                lsp_store.resolve_code_action(&buffer, actions[0].clone(), cx)
+            })
+        })
+        .await
+        .unwrap();
+    assert!(
+        resolved.lsp_action.edit().is_some(),
+        "Remote code action should be resolved through the host"
+    );
+}
+
+#[gpui::test]
 async fn test_remote_cancel_language_server_work(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,

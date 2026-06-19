@@ -1411,6 +1411,134 @@ async fn test_slow_lsp_server(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
     )
 }
 
+#[gpui::test]
+async fn test_collaborating_with_code_lens_resolve(
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let mut server = TestServer::start(cx_a.executor()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    cx_b.update(editor::init);
+    cx_b.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.editor.code_lens = Some(settings::CodeLens::Menu);
+            });
+        });
+    });
+
+    let capabilities = lsp::ServerCapabilities {
+        code_lens_provider: Some(lsp::CodeLensOptions {
+            resolve_provider: Some(true),
+        }),
+        ..lsp::ServerCapabilities::default()
+    };
+    client_a.language_registry().add(rust_lang());
+    let mut fake_language_servers = client_a.language_registry().register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            capabilities: capabilities.clone(),
+            ..FakeLspAdapter::default()
+        },
+    );
+    client_b.language_registry().add(rust_lang());
+    client_b.language_registry().register_fake_lsp_adapter(
+        "Rust",
+        FakeLspAdapter {
+            capabilities,
+            ..FakeLspAdapter::default()
+        },
+    );
+
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/dir"),
+            json!({
+                "one.rs": "const ONE: usize = 1;"
+            }),
+        )
+        .await;
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/dir"), cx_a).await;
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+
+    let (workspace_b, cx_b) = client_b.build_workspace(&project_b, cx_b);
+    let editor_b = workspace_b
+        .update_in(cx_b, |workspace, window, cx| {
+            workspace.open_path((worktree_id, rel_path("one.rs")), None, true, window, cx)
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+    let buffer_b = editor_b.update(cx_b, |editor, cx| {
+        editor.buffer().read(cx).as_singleton().unwrap()
+    });
+    let fake_language_server = fake_language_servers.next().await.unwrap();
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    // The server returns an unresolved lens (no command), forcing a
+    // `codeLens/resolve` round-trip to fill in the title.
+    fake_language_server.set_request_handler::<lsp::request::CodeLensRequest, _, _>(
+        |_, _| async move {
+            Ok(Some(vec![lsp::CodeLens {
+                range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 9)),
+                command: None,
+                data: Some(serde_json::json!({ "id": "lens" })),
+            }]))
+        },
+    );
+    fake_language_server.set_request_handler::<lsp::request::CodeLensResolve, _, _>(
+        |lens, _| async move {
+            assert!(
+                lens.command.is_none(),
+                "Host should receive the unresolved lens to resolve"
+            );
+            Ok(lsp::CodeLens {
+                command: Some(lsp::Command {
+                    title: "1 reference".to_string(),
+                    command: "noop".to_string(),
+                    arguments: None,
+                }),
+                ..lens
+            })
+        },
+    );
+
+    let range = buffer_b.read_with(cx_b, |buffer, _| {
+        let anchor = buffer.snapshot().anchor_before(0);
+        anchor..anchor
+    });
+    let lens_actions = project_b
+        .update(cx_b, |project, cx| {
+            project.code_lens_actions(&buffer_b, range, cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        lens_actions.len(),
+        1,
+        "Should have fetched one code lens action, but got: {lens_actions:?}"
+    );
+    assert_eq!(
+        lens_actions[0].lsp_action.title(),
+        "1 reference",
+        "Remote code lens should be resolved through the host"
+    );
+}
+
 #[gpui::test(iterations = 10)]
 async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut TestAppContext) {
     let mut server = TestServer::start(cx_a.executor()).await;
