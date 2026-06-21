@@ -730,6 +730,7 @@ fn main() {
         image_viewer::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
+        ai_credit_status::init(cx);
 
         audio::init(cx);
         workspace::init(app_state.clone(), cx);
