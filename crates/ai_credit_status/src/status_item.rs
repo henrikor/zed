@@ -10,10 +10,8 @@ use ui::{Label, LabelSize, ProgressBar, Tooltip, prelude::*};
 use workspace::{HideStatusItem, ItemHandle, StatusItemView};
 use zed_actions::OpenSettingsAt;
 
-use crate::fetch::{
-    CreditSnapshot, active_provider_id, fetch_credit_snapshot, usage_color,
-};
 use crate::ai_credit_settings::AiCreditStatusSettings;
+use crate::fetch::{CreditSnapshot, active_provider_id, fetch_credit_snapshot, usage_color};
 
 pub struct AiCreditStatusItem {
     snapshot: Option<CreditSnapshot>,
@@ -37,18 +35,25 @@ impl AiCreditStatusItem {
             pane_item_focus_handle: None,
         };
 
-        this._subscriptions.push(cx.observe_global::<settings::SettingsStore>(|_, cx| {
-            cx.notify();
-        }));
         this._subscriptions
-            .push(cx.subscribe(&LanguageModelRegistry::global(cx), |_, _, event, cx| {
+            .push(cx.observe_global::<settings::SettingsStore>(|this, cx| {
+                this.schedule_refresh(cx);
+                cx.notify();
+            }));
+        this._subscriptions.push(cx.subscribe(
+            &LanguageModelRegistry::global(cx),
+            |this, _, event, cx| {
                 if matches!(event, LanguageModelEvent::DefaultModelChanged) {
+                    this.schedule_refresh(cx);
                     cx.notify();
                 }
+            },
+        ));
+        this._subscriptions
+            .push(cx.observe(&this.user_store, |this, _, cx| {
+                this.schedule_refresh(cx);
+                cx.notify();
             }));
-        this._subscriptions.push(cx.observe(&this.user_store, |_, _, cx| {
-            cx.notify();
-        }));
 
         this.schedule_refresh(cx);
         this
@@ -148,7 +153,6 @@ impl AiCreditStatusItem {
                     .timer(Duration::from_secs(refresh_seconds))
                     .await;
             }
-
         }));
     }
 }
@@ -158,6 +162,10 @@ impl Render for AiCreditStatusItem {
         let settings = AiCreditStatusSettings::get_global(cx);
         if !settings.enabled || DisableAiSettings::get_global(cx).disable_ai {
             return Empty.into_any_element();
+        }
+
+        if self.refresh_task.is_none() && active_provider_id(cx).is_some() {
+            self.schedule_refresh(cx);
         }
 
         let Some(snapshot) = self.snapshot.clone() else {
@@ -177,6 +185,7 @@ impl Render for AiCreditStatusItem {
         };
 
         let percent = (snapshot.used_ratio * 100.0).round() as u32;
+        let show_percent_label = !snapshot.label.contains('%');
         let bar_color = usage_color(snapshot.used_ratio, cx);
         let tooltip = snapshot.tooltip.clone();
         let account_url = snapshot.account_url.clone();
@@ -188,20 +197,17 @@ impl Render for AiCreditStatusItem {
             .max_w(px(180.))
             .child(
                 div().w(px(96.)).child(
-                    ProgressBar::new(
-                        "ai-credit-usage",
-                        snapshot.used_ratio * 100.0,
-                        100.0,
-                        cx,
-                    )
-                    .fg_color(bar_color),
+                    ProgressBar::new("ai-credit-usage", snapshot.used_ratio * 100.0, 100.0, cx)
+                        .fg_color(bar_color),
                 ),
             )
-            .child(
-                Label::new(format!("{percent}%"))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            .when(show_percent_label, |this| {
+                this.child(
+                    Label::new(format!("{percent}%"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
             .child(
                 Label::new(snapshot.label)
                     .size(LabelSize::Small)
