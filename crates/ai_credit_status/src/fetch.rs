@@ -40,6 +40,15 @@ pub fn active_provider_id(cx: &App) -> Option<LanguageModelProviderId> {
         .map(|model| model.model.provider_id())
 }
 
+fn active_provider_api_key(provider_id: &LanguageModelProviderId, cx: &App) -> Option<String> {
+    let configured_model = LanguageModelRegistry::read_global(cx).default_model()?;
+    if configured_model.model.provider_id() == *provider_id {
+        configured_model.model.api_key(cx)
+    } else {
+        None
+    }
+}
+
 pub async fn fetch_credit_snapshot(
     provider_id: LanguageModelProviderId,
     user_store: Entity<UserStore>,
@@ -55,20 +64,22 @@ pub async fn fetch_credit_snapshot(
         return fetch_copilot(client.http_client(), cx).await;
     }
 
+    let api_key = cx.update(|cx| active_provider_api_key(&provider_id, cx));
+
     if provider_id == OPENROUTER_PROVIDER_ID {
-        return fetch_openrouter(client.http_client()).await;
+        return fetch_openrouter(client.http_client(), api_key).await;
     }
 
     if provider_id == OPEN_AI_PROVIDER_ID {
-        return fetch_openai(client.http_client(), monthly_budget_usd).await;
+        return fetch_openai(client.http_client(), monthly_budget_usd, api_key).await;
     }
 
     if provider_id == ANTHROPIC_PROVIDER_ID {
-        return fetch_anthropic(client.http_client(), monthly_budget_usd).await;
+        return fetch_anthropic(client.http_client(), monthly_budget_usd, api_key).await;
     }
 
     if provider_id == MISTRAL_PROVIDER_ID {
-        return fetch_mistral(client.http_client(), monthly_budget_usd).await;
+        return fetch_mistral(client.http_client(), monthly_budget_usd, api_key).await;
     }
 
     anyhow::bail!("Unsupported provider: {}", provider_id)
@@ -210,9 +221,14 @@ async fn fetch_copilot(http: Arc<dyn HttpClient>, cx: &AsyncApp) -> Result<Credi
     })
 }
 
-async fn fetch_openrouter(http: Arc<dyn HttpClient>) -> Result<CreditSnapshot> {
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .context("Set OPENROUTER_API_KEY to view OpenRouter credits")?;
+async fn fetch_openrouter(
+    http: Arc<dyn HttpClient>,
+    api_key: Option<String>,
+) -> Result<CreditSnapshot> {
+    let api_key = api_key
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+        .filter(|key| !key.is_empty())
+        .context("Configure OpenRouter API key in settings (or set OPENROUTER_API_KEY) to view OpenRouter credits")?;
 
     #[derive(Debug, Deserialize)]
     struct KeyResponse {
@@ -272,9 +288,14 @@ async fn fetch_openrouter(http: Arc<dyn HttpClient>) -> Result<CreditSnapshot> {
 async fn fetch_openai(
     http: Arc<dyn HttpClient>,
     monthly_budget_usd: Option<f32>,
+    api_key: Option<String>,
 ) -> Result<CreditSnapshot> {
-    let api_key =
-        std::env::var("OPENAI_API_KEY").context("Set OPENAI_API_KEY to view OpenAI usage")?;
+    let api_key = api_key
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .filter(|key| !key.is_empty())
+        .context(
+            "Configure OpenAI API key in settings (or set OPENAI_API_KEY) to view OpenAI usage",
+        )?;
     let budget = monthly_budget_usd
         .filter(|budget| *budget > 0.0)
         .context("Set ai_credit_status.monthly_budget_usd to track OpenAI usage")?;
@@ -321,9 +342,12 @@ async fn fetch_openai(
 async fn fetch_anthropic(
     http: Arc<dyn HttpClient>,
     monthly_budget_usd: Option<f32>,
+    api_key: Option<String>,
 ) -> Result<CreditSnapshot> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .context("Set ANTHROPIC_API_KEY to view Anthropic usage")?;
+    let api_key = api_key
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        .filter(|key| !key.is_empty())
+        .context("Configure Anthropic API key in settings (or set ANTHROPIC_API_KEY) to view Anthropic usage")?;
     let budget = monthly_budget_usd
         .filter(|budget| *budget > 0.0)
         .context("Set ai_credit_status.monthly_budget_usd to track Anthropic usage")?;
@@ -361,9 +385,14 @@ async fn fetch_anthropic(
 async fn fetch_mistral(
     http: Arc<dyn HttpClient>,
     monthly_budget_usd: Option<f32>,
+    api_key: Option<String>,
 ) -> Result<CreditSnapshot> {
-    let api_key =
-        std::env::var("MISTRAL_API_KEY").context("Set MISTRAL_API_KEY to view Mistral usage")?;
+    let api_key = api_key
+        .or_else(|| std::env::var("MISTRAL_API_KEY").ok())
+        .filter(|key| !key.is_empty())
+        .context(
+            "Configure Mistral API key in settings (or set MISTRAL_API_KEY) to view Mistral usage",
+        )?;
     let budget = monthly_budget_usd
         .filter(|budget| *budget > 0.0)
         .context("Set ai_credit_status.monthly_budget_usd to track Mistral usage")?;
