@@ -74,20 +74,13 @@ pub async fn fetch_credit_snapshot(
     anyhow::bail!("Unsupported provider: {}", provider_id)
 }
 
-fn zed_hosted_snapshot(
-    usage: cloud_llm_client::TokenSpendUsage,
-    cx: &App,
-) -> CreditSnapshot {
+fn zed_hosted_snapshot(usage: cloud_llm_client::TokenSpendUsage, cx: &App) -> CreditSnapshot {
     let limit = usage.limit_cents.max(1) as f32;
     let spent = usage.spent_cents as f32;
     CreditSnapshot {
         provider_label: "Zed Pro".to_string(),
         used_ratio: (spent / limit).clamp(0.0, 1.0),
-        label: format!(
-            "${:.2}/${:.2}",
-            spent / 100.0,
-            usage.limit_cents as f32 / 100.0
-        ),
+        label: format!("${:.2} used", spent / 100.0),
         tooltip: format!(
             "Zed Pro token spend: ${:.2} of ${:.2} monthly limit",
             spent / 100.0,
@@ -111,9 +104,8 @@ async fn fetch_zed_hosted(
         return Ok(snapshot);
     }
 
-    let refresh = cx.update(|cx| {
-        user_store.update(cx, |store, cx| store.refresh_authenticated_user(cx))
-    });
+    let refresh =
+        cx.update(|cx| user_store.update(cx, |store, cx| store.refresh_authenticated_user(cx)));
     refresh
         .await
         .context("failed to refresh Zed account usage")?;
@@ -192,24 +184,26 @@ async fn fetch_copilot(http: Arc<dyn HttpClient>, cx: &AsyncApp) -> Result<Credi
 
     let percent_remaining = premium.percent_remaining.unwrap_or(100.0) as f32;
     let used_ratio = ((100.0 - percent_remaining) / 100.0).clamp(0.0, 1.0);
-    let label = match (premium.quota_remaining, premium.entitlement) {
+    let usage_detail = match (premium.quota_remaining, premium.entitlement) {
         (Some(remaining), Some(total)) if total > 0.0 => {
-            format!("{:.0}% ({:.0}/{:.0})", used_ratio * 100.0, total - remaining, total)
+            Some(format!(" ({:.0}/{:.0})", total - remaining, total))
         }
-        _ => format!("{:.0}%", used_ratio * 100.0),
+        _ => None,
     };
+    let label = format!("{:.0}%", used_ratio * 100.0);
 
     let reset = parsed
         .quota_reset_date
         .map(|date| format!("\nResets {date}"))
         .unwrap_or_default();
+    let usage_detail = usage_detail.unwrap_or_default();
 
     Ok(CreditSnapshot {
         provider_label: "Copilot".to_string(),
         used_ratio,
         label,
         tooltip: format!(
-            "GitHub Copilot premium requests: {:.0}% used{reset}",
+            "GitHub Copilot premium requests: {:.0}% used{usage_detail}{reset}",
             used_ratio * 100.0
         ),
         account_url: Some("https://github.com/settings/copilot".into()),
@@ -256,7 +250,7 @@ async fn fetch_openrouter(http: Arc<dyn HttpClient>) -> Result<CreditSnapshot> {
             return Ok(CreditSnapshot {
                 provider_label: "OpenRouter".to_string(),
                 used_ratio,
-                label: format!("${:.2}/${:.2}", used, limit),
+                label: format!("${:.2} used", used),
                 tooltip: format!(
                     "OpenRouter credits: ${:.2} used of ${:.2} limit (${:.2} total usage)",
                     used, limit, data.usage
@@ -293,9 +287,7 @@ async fn fetch_openai(
         total_usage: Option<f64>,
     }
 
-    let uri = format!(
-        "https://api.openai.com/v1/usage?start_date={start}&end_date={start}"
-    );
+    let uri = format!("https://api.openai.com/v1/usage?start_date={start}&end_date={start}");
     let request = Request::builder()
         .method(Method::GET)
         .uri(uri)
@@ -317,7 +309,7 @@ async fn fetch_openai(
     Ok(CreditSnapshot {
         provider_label: "OpenAI".to_string(),
         used_ratio,
-        label: format!("${:.2}/${:.2}", spent_usd, budget),
+        label: format!("${:.2} used", spent_usd),
         tooltip: format!(
             "OpenAI usage this month: ${:.2} of ${:.2} configured budget",
             spent_usd, budget
@@ -444,18 +436,9 @@ mod tests {
     #[gpui::test]
     fn usage_color_escalates_with_ratio(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            assert_eq!(
-                usage_color(0.1, cx),
-                cx.theme().status().success
-            );
-            assert_eq!(
-                usage_color(0.4, cx),
-                cx.theme().status().warning
-            );
-            assert_eq!(
-                usage_color(0.6, cx),
-                cx.theme().status().modified
-            );
+            assert_eq!(usage_color(0.1, cx), cx.theme().status().success);
+            assert_eq!(usage_color(0.4, cx), cx.theme().status().warning);
+            assert_eq!(usage_color(0.6, cx), cx.theme().status().modified);
             assert_eq!(usage_color(0.9, cx), cx.theme().status().error);
         });
     }
