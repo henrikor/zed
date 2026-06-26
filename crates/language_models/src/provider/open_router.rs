@@ -367,6 +367,13 @@ impl LanguageModel for OpenRouterLanguageModel {
         PROVIDER_NAME
     }
 
+    fn api_key(&self, cx: &App) -> Option<String> {
+        self.state.read_with(cx, |state, cx| {
+            let api_url = OpenRouterLanguageModelProvider::api_url(cx);
+            state.api_key_state.key(&api_url).map(|key| key.to_string())
+        })
+    }
+
     fn supports_tools(&self) -> bool {
         self.model.supports_tool_calls()
     }
