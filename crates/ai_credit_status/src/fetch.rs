@@ -18,6 +18,7 @@ const OPENROUTER_PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId:
 const MISTRAL_PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("mistral");
 use project::DisableAiSettings;
 use serde::Deserialize;
+use serde_json::Value;
 use settings::Settings;
 use theme::ActiveTheme;
 
@@ -27,6 +28,7 @@ pub struct CreditSnapshot {
     pub used_ratio: f32,
     pub label: String,
     pub tooltip: String,
+    pub uses_estimated_budget: bool,
     pub account_url: Option<String>,
 }
 
@@ -97,6 +99,7 @@ fn zed_hosted_snapshot(usage: cloud_llm_client::TokenSpendUsage, cx: &App) -> Cr
             spent / 100.0,
             usage.limit_cents as f32 / 100.0
         ),
+        uses_estimated_budget: false,
         account_url: Some(zed_urls::account_url(cx)),
     }
 }
@@ -189,6 +192,7 @@ async fn fetch_copilot(http: Arc<dyn HttpClient>, cx: &AsyncApp) -> Result<Credi
             used_ratio: 0.0,
             label: "Premium included".to_string(),
             tooltip: "GitHub Copilot premium requests are included with your plan".to_string(),
+            uses_estimated_budget: false,
             account_url: Some("https://github.com/settings/copilot".into()),
         });
     }
@@ -217,6 +221,7 @@ async fn fetch_copilot(http: Arc<dyn HttpClient>, cx: &AsyncApp) -> Result<Credi
             "GitHub Copilot premium requests: {:.0}% used{usage_detail}{reset}",
             used_ratio * 100.0
         ),
+        uses_estimated_budget: false,
         account_url: Some("https://github.com/settings/copilot".into()),
     })
 }
@@ -271,6 +276,7 @@ async fn fetch_openrouter(
                     "OpenRouter credits: ${:.2} used of ${:.2} limit (${:.2} total usage)",
                     used, limit, data.usage
                 ),
+                uses_estimated_budget: false,
                 account_url: Some("https://openrouter.ai/settings/credits".into()),
             });
         }
@@ -281,6 +287,7 @@ async fn fetch_openrouter(
         used_ratio: 0.0,
         label: format!("${:.2} used", data.usage),
         tooltip: format!("OpenRouter total usage: ${:.2}", data.usage),
+        uses_estimated_budget: false,
         account_url: Some("https://openrouter.ai/settings/credits".into()),
     })
 }
@@ -290,53 +297,166 @@ async fn fetch_openai(
     monthly_budget_usd: Option<f32>,
     api_key: Option<String>,
 ) -> Result<CreditSnapshot> {
-    let api_key = api_key
+    let provider_api_key = api_key
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .filter(|key| !key.is_empty())
         .context(
             "Configure OpenAI API key in settings (or set OPENAI_API_KEY) to view OpenAI usage",
         )?;
-    let budget = monthly_budget_usd
-        .filter(|budget| *budget > 0.0)
-        .context("Set ai_credit_status.monthly_budget_usd to track OpenAI usage")?;
+    let usage_api_key = std::env::var("OPENAI_ADMIN_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .unwrap_or_else(|| provider_api_key.clone());
+    let budget = monthly_budget_usd.filter(|budget| *budget > 0.0);
 
     let now = Utc::now();
     let start = format!("{}-{:02}-01", now.year(), now.month());
+    let end = format!("{}-{:02}-{:02}", now.year(), now.month(), now.day());
+    let start_of_month = now
+        .date_naive()
+        .with_day(1)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|date_time| date_time.and_utc())
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to compute OpenAI usage start-of-month timestamp")
+        })?;
+    let start_time = start_of_month.timestamp();
+    let end_time = now.timestamp();
 
-    #[derive(Debug, Deserialize)]
-    struct UsageResponse {
-        total_usage: Option<f64>,
+    let candidate_uris = [
+        format!(
+            "https://api.openai.com/v1/organization/costs?start_time={start_time}&end_time={end_time}&bucket_width=1d"
+        ),
+        format!(
+            "https://api.openai.com/v1/dashboard/billing/usage?start_date={start}&end_date={end}"
+        ),
+        format!("https://api.openai.com/v1/usage?start_date={start}&end_date={end}"),
+        format!("https://api.openai.com/v1/usage?date={end}"),
+    ];
+
+    let mut errors = Vec::new();
+    let mut spent_usd = None;
+    for uri in candidate_uris {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(uri.clone())
+            .header("Authorization", format!("Bearer {usage_api_key}"))
+            .body(AsyncBody::default())?;
+
+        let mut response = http.send(request).await?;
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+
+        if !response.status().is_success() {
+            errors.push(format!("{uri}: {body}"));
+            continue;
+        }
+
+        let parsed: Value = serde_json::from_str(&body)?;
+        if let Some(parsed_spent_usd) = parse_openai_spent_usd(&parsed) {
+            spent_usd = Some(parsed_spent_usd);
+            break;
+        }
+
+        errors.push(format!("{uri}: unexpected response format"));
     }
 
-    let uri = format!("https://api.openai.com/v1/usage?start_date={start}&end_date={start}");
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .body(AsyncBody::default())?;
+    if let Some(spent_usd) = spent_usd {
+        let used_ratio = budget
+            .map(|budget| (spent_usd / budget as f64).clamp(0.0, 1.0) as f32)
+            .unwrap_or(0.0);
+        let tooltip = if let Some(budget) = budget {
+            format!(
+                "OpenAI usage this month: ${:.2} of ${:.2} configured budget",
+                spent_usd, budget
+            )
+        } else {
+            format!(
+                "OpenAI usage this month: ${:.2}. Configure ai_credit_status.monthly_budget_usd to track percentage.",
+                spent_usd
+            )
+        };
 
-    let mut response = http.send(request).await?;
-    let mut body = String::new();
-    response.body_mut().read_to_string(&mut body).await?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("OpenAI usage request failed: {}", body);
+        return Ok(CreditSnapshot {
+            provider_label: "OpenAI".to_string(),
+            used_ratio,
+            label: format!("${:.2} used this month", spent_usd),
+            tooltip,
+            uses_estimated_budget: false,
+            account_url: Some("https://platform.openai.com/usage".into()),
+        });
     }
 
-    let parsed: UsageResponse = serde_json::from_str(&body)?;
-    let spent_usd = parsed.total_usage.unwrap_or(0.0) / 100.0;
-    let used_ratio = (spent_usd / budget as f64).clamp(0.0, 1.0) as f32;
+    let usage_requires_session_key = errors
+        .iter()
+        .any(|error| error.to_ascii_lowercase().contains("session key"));
+
+    let (label, tooltip, uses_estimated_budget) = if budget.is_some() {
+        (
+            "".to_string(),
+            if usage_requires_session_key {
+                "OpenAI usage endpoint rejected API-key access (requires browser session key). \
+                 There is usually no account toggle to enable this endpoint for standard API keys. \
+                 Tip: use an Organization Admin API key with OpenAI organization usage/cost APIs for programmatic access. \
+                 Check https://platform.openai.com/usage for actual spend."
+                    .to_string()
+            } else {
+                "OpenAI usage endpoint did not return parsable data. \
+                 Check https://platform.openai.com/usage for actual spend."
+                    .to_string()
+            },
+            true,
+        )
+    } else {
+        (
+            "Usage unavailable".to_string(),
+            if usage_requires_session_key {
+                "OpenAI usage endpoint rejected API-key access (requires browser session key). There is usually no account toggle to enable this endpoint for standard API keys. Tip: use an Organization Admin API key with OpenAI organization usage/cost APIs for programmatic access. Open https://platform.openai.com/usage for actual spend, or configure ai_credit_status.monthly_budget_usd for an estimated monthly label.".to_string()
+            } else {
+                format!(
+                    "OpenAI usage endpoint did not return parsable data. Latest errors: {}",
+                    errors.join(" | ")
+                )
+            },
+            false,
+        )
+    };
 
     Ok(CreditSnapshot {
         provider_label: "OpenAI".to_string(),
-        used_ratio,
-        label: format!("${:.2} used", spent_usd),
-        tooltip: format!(
-            "OpenAI usage this month: ${:.2} of ${:.2} configured budget",
-            spent_usd, budget
-        ),
+        used_ratio: 0.0,
+        label,
+        tooltip,
+        uses_estimated_budget,
         account_url: Some("https://platform.openai.com/usage".into()),
     })
+}
+
+fn parse_openai_spent_usd(parsed: &Value) -> Option<f64> {
+    if let Some(total_usage_cents) = parsed.get("total_usage").and_then(Value::as_f64) {
+        return Some(total_usage_cents / 100.0);
+    }
+
+    let mut total_cost = 0.0;
+    let mut found_cost = false;
+    if let Some(data) = parsed.get("data").and_then(Value::as_array) {
+        for bucket in data {
+            if let Some(results) = bucket.get("results").and_then(Value::as_array) {
+                for result in results {
+                    if let Some(cost_value) = result
+                        .get("amount")
+                        .and_then(|amount| amount.get("value"))
+                        .and_then(Value::as_f64)
+                    {
+                        total_cost += cost_value;
+                        found_cost = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if found_cost { Some(total_cost) } else { None }
 }
 
 async fn fetch_anthropic(
@@ -348,9 +468,7 @@ async fn fetch_anthropic(
         .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
         .filter(|key| !key.is_empty())
         .context("Configure Anthropic API key in settings (or set ANTHROPIC_API_KEY) to view Anthropic usage")?;
-    let budget = monthly_budget_usd
-        .filter(|budget| *budget > 0.0)
-        .context("Set ai_credit_status.monthly_budget_usd to track Anthropic usage")?;
+    let budget = monthly_budget_usd.filter(|budget| *budget > 0.0);
 
     let request = Request::builder()
         .method(Method::GET)
@@ -366,18 +484,28 @@ async fn fetch_anthropic(
         anyhow::bail!("Anthropic request failed: {}", body);
     }
 
-    // Anthropic does not expose remaining credits on standard API keys. Surface
-    // configured budget guidance until a billing endpoint is available.
+    let (label, tooltip, uses_estimated_budget) = if budget.is_some() {
+        (
+            "".to_string(),
+            "Anthropic does not expose remaining credits via API. \
+             Check https://console.anthropic.com/settings/billing for actual spend."
+                .to_string(),
+            true,
+        )
+    } else {
+        (
+            "Usage unavailable".to_string(),
+            "Anthropic does not expose remaining credits via API. Configure ai_credit_status.monthly_budget_usd to show an estimated monthly spend label, or check https://console.anthropic.com/settings/billing for actual spend.".to_string(),
+            false,
+        )
+    };
+
     Ok(CreditSnapshot {
         provider_label: "Anthropic".to_string(),
         used_ratio: 0.0,
-        label: format!("Budget ${:.2}", budget),
-        tooltip: format!(
-            "Anthropic does not expose remaining credits via API. \
-             Configure ai_credit_status.monthly_budget_usd (${:.2}) and check \
-             https://console.anthropic.com/settings/billing for actual spend.",
-            budget
-        ),
+        label,
+        tooltip,
+        uses_estimated_budget,
         account_url: Some("https://console.anthropic.com/settings/billing".into()),
     })
 }
@@ -393,9 +521,7 @@ async fn fetch_mistral(
         .context(
             "Configure Mistral API key in settings (or set MISTRAL_API_KEY) to view Mistral usage",
         )?;
-    let budget = monthly_budget_usd
-        .filter(|budget| *budget > 0.0)
-        .context("Set ai_credit_status.monthly_budget_usd to track Mistral usage")?;
+    let budget = monthly_budget_usd.filter(|budget| *budget > 0.0);
 
     let request = Request::builder()
         .method(Method::GET)
@@ -410,16 +536,28 @@ async fn fetch_mistral(
         anyhow::bail!("Mistral request failed: {}", body);
     }
 
+    let (label, tooltip, uses_estimated_budget) = if budget.is_some() {
+        (
+            "".to_string(),
+            "Mistral does not expose remaining credits via API. \
+             Check https://console.mistral.ai/billing for actual spend."
+                .to_string(),
+            true,
+        )
+    } else {
+        (
+            "Usage unavailable".to_string(),
+            "Mistral does not expose remaining credits via API. Configure ai_credit_status.monthly_budget_usd to show an estimated monthly spend label, or check https://console.mistral.ai/billing for actual spend.".to_string(),
+            false,
+        )
+    };
+
     Ok(CreditSnapshot {
         provider_label: "Mistral".to_string(),
         used_ratio: 0.0,
-        label: format!("Budget ${:.2}", budget),
-        tooltip: format!(
-            "Mistral does not expose remaining credits via API. \
-             Configure ai_credit_status.monthly_budget_usd (${:.2}) and check \
-             https://console.mistral.ai/billing for actual spend.",
-            budget
-        ),
+        label,
+        tooltip,
+        uses_estimated_budget,
         account_url: Some("https://console.mistral.ai/billing".into()),
     })
 }
