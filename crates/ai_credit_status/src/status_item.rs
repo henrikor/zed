@@ -185,8 +185,21 @@ impl Render for AiCreditStatusItem {
         };
 
         let percent = (snapshot.used_ratio * 100.0).round() as u32;
-        let show_percent_label = !snapshot.label.contains('%');
+        let show_progress = snapshot.used_ratio > 0.0 || snapshot.uses_estimated_budget;
+        let show_percent_label = snapshot.used_ratio > 0.0
+            && !snapshot.uses_estimated_budget
+            && !snapshot.label.contains('%');
         let bar_color = usage_color(snapshot.used_ratio, cx);
+        let placeholder_bg_color = cx.theme().colors().text_disabled.opacity(0.2);
+        let placeholder_fg_color = cx.theme().colors().text_disabled.opacity(0.5);
+        let progress_bar = if snapshot.uses_estimated_budget {
+            ProgressBar::new("ai-credit-usage", 100.0, 100.0, cx)
+                .bg_color(placeholder_bg_color)
+                .fg_color(placeholder_fg_color)
+        } else {
+            ProgressBar::new("ai-credit-usage", snapshot.used_ratio * 100.0, 100.0, cx)
+                .fg_color(bar_color)
+        };
         let tooltip = snapshot.tooltip.clone();
         let account_url = snapshot.account_url.clone();
 
@@ -194,13 +207,10 @@ impl Render for AiCreditStatusItem {
             .id("ai-credit-status")
             .gap_1()
             .items_center()
-            .max_w(px(180.))
-            .child(
-                div().w(px(96.)).child(
-                    ProgressBar::new("ai-credit-usage", snapshot.used_ratio * 100.0, 100.0, cx)
-                        .fg_color(bar_color),
-                ),
-            )
+            .max_w(px(220.))
+            .when(show_progress, |this| {
+                this.child(div().w(px(96.)).child(progress_bar))
+            })
             .when(show_percent_label, |this| {
                 this.child(
                     Label::new(format!("{percent}%"))
@@ -208,12 +218,14 @@ impl Render for AiCreditStatusItem {
                         .color(Color::Muted),
                 )
             })
-            .child(
-                Label::new(snapshot.label)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .truncate(),
-            )
+            .when(!snapshot.label.is_empty(), |this| {
+                this.child(
+                    Label::new(snapshot.label)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+            })
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(move |_, _, window, cx| {
                 if let Some(url) = account_url.clone() {
