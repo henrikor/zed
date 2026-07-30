@@ -98,14 +98,18 @@
 
         shellHook = ''
           # On non-NixOS Linux, the Nix shell may not see system GPU libs/ICDs.
-          # Expose host driver paths so Vulkan can load the platform ICD.
+          # Expose host driver paths so Vulkan can load platform drivers.
           if [[ "$(uname)" == "Linux" && ! -d /run/opengl-driver ]]; then
             export LD_LIBRARY_PATH="/usr/lib:/usr/lib32''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-            if [[ -f /usr/share/vulkan/icd.d/nvidia_icd.json ]]; then
-              export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/nvidia_icd.json"
-            elif [[ -f /usr/share/vulkan/icd.d/intel_icd.json ]]; then
-              export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/intel_icd.json"
+            # Avoid forcing a single ICD on hybrid systems (e.g. Intel + NVIDIA),
+            # where pinning the wrong ICD can break surface creation. Let the Vulkan
+            # loader auto-discover when multiple ICDs are present.
+            if [[ -d /usr/share/vulkan/icd.d ]]; then
+              mapfile -t _zed_icds < <(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name '*_icd*.json' | sort)
+              if [[ "''${#_zed_icds[@]}" -eq 1 ]]; then
+                export VK_ICD_FILENAMES="''${_zed_icds[0]}"
+              fi
             fi
           fi
         '';
