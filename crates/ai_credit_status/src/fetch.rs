@@ -603,6 +603,9 @@ mod tests {
     #[gpui::test]
     fn usage_color_escalates_with_ratio(cx: &mut TestAppContext) {
         cx.update(|cx| {
+            settings::init(cx);
+            theme::init(theme::LoadThemes::JustBase, cx);
+
             assert_eq!(usage_color(0.1, cx), cx.theme().status().success);
             assert_eq!(usage_color(0.4, cx), cx.theme().status().warning);
             assert_eq!(usage_color(0.6, cx), cx.theme().status().modified);

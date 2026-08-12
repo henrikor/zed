@@ -632,6 +632,13 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));
         let line_ending_indicator =
             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
+        let ai_credit_status = cx.new(|cx| {
+            ai_credit_status::AiCreditStatusItem::new(
+                app_state.user_store.clone(),
+                app_state.client.clone(),
+                cx,
+            )
+        });
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let ai_credit_status = cx.new(|cx| {
             ai_credit_status::AiCreditStatusItem::new(

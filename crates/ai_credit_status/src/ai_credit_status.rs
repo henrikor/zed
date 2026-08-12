@@ -1,5 +1,5 @@
-mod fetch;
 mod ai_credit_settings;
+mod fetch;
 mod status_item;
 
 pub use ai_credit_settings::AiCreditStatusSettings;
