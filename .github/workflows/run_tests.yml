@@ -604,6 +604,8 @@ jobs:
       run: cargo build -p collab
     - name: cargo build --workspace --bins --examples
       run: cargo build --workspace --bins --examples
+    - name: cargo build -p zed --features remote/build-remote-server-binary
+      run: cargo build -p zed --features remote/build-remote-server-binary
     - name: steps::show_sccache_stats
       run: sccache --show-stats || true
     - name: steps::cleanup_cargo_config
