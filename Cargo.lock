@@ -598,7 +598,7 @@ dependencies = [
  "cloud_api_types",
  "cloud_llm_client",
  "copilot_chat",
- "futures 0.3.32",
+ "futures 0.3.34",
  "gpui",
  "http_client",
  "language_model",

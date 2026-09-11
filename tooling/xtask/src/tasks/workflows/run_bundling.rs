@@ -14,6 +14,10 @@ use super::{runners, steps};
 use gh_workflow::*;
 use indoc::indoc;
 
+/// Branch that builds the Linux client on every push, so it doesn't need the
+/// `run-bundling` label while iterating on it.
+const AI_CREDIT_STATUS_BAR_BRANCH: &str = "ai-credit-status-bar";
+
 pub fn run_bundling() -> Workflow {
     let bundle = ReleaseBundleJobs {
         linux_aarch64: bundle_linux(Arch::AARCH64, None, &[]),
@@ -27,9 +31,12 @@ pub fn run_bundling() -> Workflow {
     };
     named::workflow()
         .with_minimal_permissions()
-        .on(Event::default().pull_request(
-            PullRequest::default().types([PullRequestType::Labeled, PullRequestType::Synchronize]),
-        ))
+        .on(Event::default()
+            .pull_request(
+                PullRequest::default()
+                    .types([PullRequestType::Labeled, PullRequestType::Synchronize]),
+            )
+            .push(Push::default().add_branch(AI_CREDIT_STATUS_BAR_BRANCH)))
         .concurrency(
             Concurrency::new(Expression::new(
                 "${{ github.workflow }}-${{ github.head_ref || github.ref }}",
@@ -53,6 +60,18 @@ fn bundle_job(deps: &[&NamedJob]) -> Job {
                 indoc! {
                     r#"(github.event.action == 'labeled' && github.event.label.name == 'run-bundling') ||
                     (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'run-bundling'))"#,
+                })))
+        .timeout_minutes(60u32)
+}
+
+fn bundle_linux_job(deps: &[&NamedJob]) -> Job {
+    dependant_job(deps)
+        .when(deps.len() == 0, |job|
+            job.cond(Expression::new(
+                indoc::formatdoc! {
+                    r#"(github.event.action == 'labeled' && github.event.label.name == 'run-bundling') ||
+                    (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'run-bundling')) ||
+                    (github.event_name == 'push' && github.ref == 'refs/heads/{AI_CREDIT_STATUS_BAR_BRANCH}')"#,
                 })))
         .timeout_minutes(60u32)
 }
@@ -162,7 +181,7 @@ pub(crate) fn bundle_linux(
     };
     NamedJob {
         name: format!("bundle_linux_{arch}"),
-        job: bundle_job(deps)
+        job: bundle_linux_job(deps)
             .runs_on(arch.linux_bundler())
             .envs(bundle_envs(platform))
             .add_env(Env::new("CC", "clang-18"))
