@@ -278,14 +278,16 @@ async fn build_remote_server_from_source(
         let output = command
             .kill_on_drop(true)
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .output()
             .await?;
-        anyhow::ensure!(
-            output.status.success(),
-            "Failed to run command: {command:?}: output: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if !output.status.success() {
+            // stderr is captured rather than inherited so that the reason for the
+            // failure reaches the user, at the cost of losing live build progress.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("failed to run command: {command:?}:\n{stderr}");
+            anyhow::bail!("Failed to run command: {command:?}: output: {stderr}");
+        }
         Ok(())
     }
 
