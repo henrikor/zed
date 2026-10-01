@@ -39,16 +39,16 @@ pub fn active_provider_id(cx: &App) -> Option<LanguageModelProviderId> {
 
     LanguageModelRegistry::read_global(cx)
         .default_model()
-        .map(|model| model.model.provider_id())
+        .map(|model| model.provider_id)
 }
 
 fn active_provider_api_key(provider_id: &LanguageModelProviderId, cx: &App) -> Option<String> {
-    let configured_model = LanguageModelRegistry::read_global(cx).default_model()?;
-    if configured_model.model.provider_id() == *provider_id {
-        configured_model.model.api_key(cx)
-    } else {
-        None
+    let registry = LanguageModelRegistry::read_global(cx);
+    let model = registry.default_model()?;
+    if model.provider_id != *provider_id {
+        return None;
     }
+    registry.provider(provider_id)?.api_key(&model, cx)
 }
 
 pub async fn fetch_credit_snapshot(
