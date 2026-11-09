@@ -1,12 +1,12 @@
 use crate::types::TableCell;
-use gpui::{AnyElement, Entity};
+use gpui::{AnyElement, Entity, Hsla};
 use std::ops::Range;
 use ui::{ColumnWidthConfig, ResizableColumnsState, Table, UncheckedTableRow, div, prelude::*};
 
 use crate::{
     TableView,
     settings::RowRenderMechanism,
-    types::{AnyColumn, DisplayCellId, DisplayRow},
+    types::{AnyColumn, DataCellId, DisplayCellId, DisplayRow},
 };
 
 impl TableView {
@@ -98,13 +98,18 @@ impl TableView {
         this: &TableView,
         cols: usize,
         display_row: DisplayRow,
-        row_identifier_text_color: gpui::Hsla,
+        row_identifier_text_color: Hsla,
         row_height: Pixels,
         cx: &Context<TableView>,
     ) -> Option<UncheckedTableRow<AnyElement>> {
         // Get the actual row index from our sorted indices
         let data_row = this.engine.d2d_mapping().get_data_row(display_row)?;
         let row = this.engine.contents.get_row(data_row)?;
+
+        let selection_bounds = this
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.display_bounds(this.engine.d2d_mapping()));
 
         let mut elements = Vec::with_capacity(cols);
         elements.push(this.create_row_identifier_cell(display_row, data_row, cx)?);
@@ -117,6 +122,27 @@ impl TableView {
             let cell_content = table_cell.display_value().cloned().unwrap_or_default();
 
             let display_cell_id = DisplayCellId::new(display_row, col);
+            let data_cell_id = DataCellId::new(data_row, col);
+
+            let is_in_selection =
+                selection_bounds
+                    .as_ref()
+                    .is_some_and(|(row_range, col_range)| {
+                        row_range.contains(&display_row.0) && col_range.contains(&col.0)
+                    });
+
+            let is_focus_cell = this
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.focus == data_cell_id);
+
+            let cell_bg = if is_focus_cell {
+                Some(cx.theme().colors().element_selected)
+            } else if is_in_selection {
+                Some(cx.theme().colors().element_hover)
+            } else {
+                None
+            };
 
             let cell = div()
                 .size_full()
@@ -139,6 +165,7 @@ impl TableView {
             elements.push(
                 div()
                     .size_full()
+                    .when_some(cell_bg, |div, color| div.bg(color))
                     .when(this.settings.show_debug_info, |parent| {
                         parent.child(div().text_color(row_identifier_text_color).child(
                             match table_cell {
