@@ -2,16 +2,49 @@
 
 set -euxo pipefail
 
-if [[ $# -gt 0 ]]; then
-  echo "
-  Usage: ${0##*/}
-  Builds and installs zed onto your system into ~/.local, making it available as ~/.local/bin/zed.
+help_info() {
+  cat <<'HELP'
+Usage: script/install-linux [--remote-windows <ssh-destination>]
+Build and install Zed into ~/.local, making it available as ~/.local/bin/zed.
 
-  Before running this you should ensure you have all the build dependencies installed with `./script/linux`.
-  "
-  exit 1
-fi
+Install build dependencies first with ./script/linux.
+
+Options:
+  --remote-windows HOST  Also build and install this checkout's Windows remote
+                         server over SSH (requires cargo-xwin; see
+                         script/install-remote-server-windows --help).
+  -h, --help             Display this help and exit.
+HELP
+}
+
+remote_windows_destination=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h|--help)
+      help_info
+      exit 0
+      ;;
+    --remote-windows)
+      if [[ $# -lt 2 || -z $2 || $2 == -* || -n $remote_windows_destination ]]; then
+        echo 'Error: --remote-windows requires one SSH destination and may only be used once.' >&2
+        exit 2
+      fi
+      remote_windows_destination=$2
+      shift 2
+      ;;
+    *)
+      echo "Error: unexpected argument: $1" >&2
+      help_info >&2
+      exit 2
+      ;;
+  esac
+done
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 export ZED_CHANNEL=$(<crates/zed/RELEASE_CHANNEL)
+if [[ -n $remote_windows_destination ]]; then
+  script/install-remote-server-windows "$remote_windows_destination"
+fi
 export ZED_UPDATE_EXPLANATION="You need to fetch and rebuild zed in $(pwd)"
 script/bundle-linux
 

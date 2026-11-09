@@ -53,6 +53,54 @@ You can install a local build on your machine with:
 
 This builds `zed` and the `cli` in release mode, installs the binary at `~/.local/bin/zed`, and installs `.desktop` files to `~/.local/share`.
 
+### Connecting a local build to Windows over SSH
+
+A local development-channel release build cannot download a matching remote
+server from Zed's releases. `install-linux` builds a Linux remote server, not a
+Windows executable. To build and install the Windows server from the same
+checkout, install the cross-compilation tools first:
+
+```sh
+# Manjaro / Arch Linux
+sudo pacman -S --needed clang lld llvm cmake ninja openssh jq
+cargo install --locked cargo-xwin
+```
+
+`cargo-xwin` downloads Microsoft's CRT and Windows SDK. Using it accepts
+[Microsoft's license](https://go.microsoft.com/fwlink/?LinkId=2086102). The scripts
+below add the required Rust target and `llvm-tools` component via `rustup`.
+
+Configure an SSH alias with the port, username, and authentication settings that
+work in your terminal. Then build and install both the editor and Windows server:
+
+```sh
+./script/install-linux --remote-windows win11
+```
+
+If you already installed the editor from this checkout, install only the Windows
+server without rebuilding the editor:
+
+```sh
+./script/install-remote-server-windows win11
+```
+
+You can also pass a quoted SSH destination, such as
+`'Henrik Ormåsen@192.168.122.205'`. The remote host needs Windows PowerShell and
+SFTP enabled in its SSH server. The script detects x86-64 or ARM64, cross-compiles
+`remote_server` in release mode, uploads it, and checks its version before
+replacing the installed server. It respects `CARGO_TARGET_DIR`.
+
+Use the same checkout revision and release channel for the editor and server.
+Rerun the server installer whenever you rebuild the editor from updated sources.
+For the development channel, the installed path is
+`.zed_server/zed-remote-server-dev-build.exe` in the remote SSH login folder. Zed
+finds it without `ZED_BUILD_REMOTE_SERVER` or `ZED_COPY_REMOTE_SERVER`, including
+when you launch the editor from the application menu.
+
+Disconnect remote sessions before replacing an existing server. If Windows still
+has the executable in use, stop that server manually and rerun the installer; the
+script does not kill processes.
+
 ## Wayland & X11
 
 Zed supports both X11 and Wayland. By default, we pick whichever we can find at runtime. If you're on Wayland and want to run in X11 mode, use the environment variable `WAYLAND_DISPLAY=''`.

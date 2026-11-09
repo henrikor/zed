@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+help_info() {
+    cat <<'HELP'
+Usage: script/install-remote-server-windows <ssh-destination>
+       script/install-remote-server-windows -h|--help
+
+Cross-compile this checkout's remote_server for Windows and install it over SSH.
+Use the same checkout, commit, and RELEASE_CHANNEL as your script/install-linux
+editor. No editor rebuild or runtime environment variables are needed.
+
+Examples:
+  script/install-remote-server-windows windows-vm
+  script/install-remote-server-windows 'Henrik Ormåsen@192.168.1.100'
+
+Requires the Linux build dependencies, clang/clang-cl, lld-link, llvm-rc, rustup,
+cargo, cargo-xwin, cmake, ninja, git, jq, ssh, scp, iconv, and base64. Install cargo-xwin with:
+  cargo install --locked cargo-xwin
+cargo-xwin downloads Microsoft's CRT and Windows SDK; using it accepts their
+license: https://go.microsoft.com/fwlink/?LinkId=2086102
+SSH must provide powershell.exe and SFTP. Configure ports/keys in ~/.ssh/config.
+CARGO_TARGET_DIR is respected (default: target/remote_server in this checkout).
+An in-use server must be stopped manually before replacement; no processes are killed.
+HELP
+}
+
+if [[ $# -eq 1 && ( $1 == -h || $1 == --help ) ]]; then
+    help_info
+    exit 0
+fi
+if [[ $# -ne 1 || -z ${1-} || ${1-} == -* ]]; then
+    echo 'Error: expected exactly one SSH destination, not an option.' >&2
+    help_info >&2
+    exit 2
+fi
+destination=$1
+
+for dependency in dirname cat cargo-xwin cargo rustup clang clang-cl lld-link llvm-rc cmake ninja git jq ssh scp iconv base64 tr; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+        echo "Error: missing dependency: $dependency" >&2
+        echo 'On Manjaro, install clang, lld, llvm, cmake, ninja, openssh and jq; also install Rust via rustup.' >&2
+        echo 'Install cargo-xwin with: cargo install --locked cargo-xwin' >&2
+        echo "cargo-xwin downloads Microsoft's CRT/Windows SDK; using it accepts Microsoft's license:" >&2
+        echo 'https://go.microsoft.com/fwlink/?LinkId=2086102' >&2
+        exit 1
+    fi
+done
+checkout=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd -- "$checkout"
+
+if [[ -n ${RUSTFLAGS+x} || -n ${CARGO_ENCODED_RUSTFLAGS+x} ]]; then
+    echo 'Error: unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS so .cargo/config.toml Windows flags are preserved.' >&2
+    exit 1
+fi
+channel=$(tr -d '[:space:]' < crates/zed/RELEASE_CHANNEL)
+case $channel in dev|nightly|preview|stable) ;; *) echo "Error: invalid channel: $channel" >&2; exit 1 ;; esac
+if [[ -n ${ZED_RELEASE_CHANNEL+x} && $ZED_RELEASE_CHANNEL != "$channel" ]]; then
+    echo 'Error: unset ZED_RELEASE_CHANNEL; the server and editor must use crates/zed/RELEASE_CHANNEL.' >&2
+    exit 1
+fi
+export ZED_CHANNEL="$channel" ZED_BUNDLE=true
+
+# Encoding avoids shell-specific quoting and leaves SSH stdin available for authentication.
+remote_powershell() {
+    local encoded
+    encoded=$(printf '%s' "\$ErrorActionPreference = 'Stop'; try { $1 } catch { [Console]::Error.WriteLine(\$_.ToString()); exit 1 }" \
+        | iconv -f UTF-8 -t UTF-16LE | base64 -w 0) || return
+    ssh -- "$destination" "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+}
+
+echo "Detecting Windows architecture on $destination..."
+architecture=$(remote_powershell '
+    switch ((Get-CimInstance Win32_Processor | Select-Object -First 1).Architecture) {
+        9 { Write-Output "x86_64" }
+        12 { Write-Output "aarch64" }
+        default { throw "Unsupported Windows processor architecture (expected AMD64 or ARM64)." }
+    }
+')
+architecture=${architecture//$'\r'/}
+case $architecture in x86_64|aarch64) ;; *) echo "Error: unexpected architecture output: $architecture" >&2; exit 1 ;; esac
+target="$architecture-pc-windows-msvc"
+
+version=$(script/get-crate-version zed)
+commit=$(git --no-pager rev-parse HEAD)
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ || ! $commit =~ ^[0-9a-f]{40,64}$ ]]; then
+    echo 'Error: could not determine the Zed crate version and checkout commit.' >&2
+    exit 1
+fi
+if [[ -n ${GITHUB_RUN_NUMBER+x} && ! ${GITHUB_RUN_NUMBER-} =~ ^[0-9]+$ ]] || [[ ${ZED_COMMIT_SHA:-$commit} != "$commit" ]]; then
+    echo 'Error: GITHUB_RUN_NUMBER must be numeric and ZED_COMMIT_SHA must match this checkout.' >&2
+    exit 1
+fi
+export RELEASE_VERSION="$version"
+# AppVersion adds channel/build/commit metadata even for stable; dev alone uses "build".
+version_suffix="${version%%+*}+$channel${GITHUB_RUN_NUMBER:+.$GITHUB_RUN_NUMBER}.$commit"
+expected_version="$version"
+if [[ $channel == dev || $channel == nightly ]]; then
+    expected_version="${GITHUB_RUN_NUMBER:+$GITHUB_RUN_NUMBER+}$commit"
+fi
+if [[ $channel == dev ]]; then version_suffix=build; fi
+final_path=".zed_server/zed-remote-server-$channel-$version_suffix.exe"
+target_dir="${CARGO_TARGET_DIR:-target/remote_server}"
+if [[ $target_dir != /* ]]; then target_dir="$checkout/$target_dir"; fi
+
+echo "Building $target for channel $channel..."
+echo "cargo-xwin downloads Microsoft's CRT/Windows SDK; using it accepts Microsoft's license:"
+echo 'https://go.microsoft.com/fwlink/?LinkId=2086102'
+rustup target add "$target"
+rustup component add llvm-tools
+# Build only remote_server so editor features cannot change its dependencies.
+# gpui_windows embeds release shaders generated by a Windows-only build script.
+# Select runtime shaders for this dependency; the headless server never renders.
+cargo xwin build --locked --release --package remote_server --target "$target" --target-dir "$target_dir" \
+    --config 'profile.release.package.gpui_windows.debug-assertions=true'
+binary="$target_dir/$target/release/remote_server.exe"
+if [[ ! -f $binary ]]; then echo "Error: built executable not found: $binary" >&2; exit 1; fi
+
+temporary_path=".zed_server/upload-$channel-$$-$RANDOM.exe"
+echo "Uploading to $destination:$temporary_path..."
+remote_powershell "New-Item -ItemType Directory -Path '.zed_server' -Force | Out-Null"
+scp -- "$binary" "$destination:$temporary_path"
+remote_powershell "
+    \$version = & './$temporary_path' version
+    if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
+    Write-Output \"Remote server version: \$version\"
+    if (\"\$version\".Trim() -ne '$expected_version') {
+        throw 'Server version does not match this checkout; the existing server was not replaced.'
+    }
+    try {
+        Move-Item -LiteralPath './$temporary_path' -Destination './$final_path' -Force
+    } catch {
+        throw (\"Cannot replace $final_path. If it is in use, disconnect Zed remote sessions and stop that server manually, then rerun. No processes were killed. Upload remains at $temporary_path. \" + \$_.Exception.Message)
+    }
+"
+echo "Installed $destination:$final_path"
+echo 'Reconnect from the Zed editor built from this checkout.'

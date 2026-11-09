@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+CHECKOUT = Path(__file__).resolve().parent.parent
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+MOCK_COMMAND = r'''
+import base64
+import json
+import os
+from pathlib import Path
+import sys
+
+command = Path(sys.argv[0]).name
+arguments = sys.argv[1:]
+record = {"command": command, "arguments": arguments}
+if command == "ssh":
+    record["powershell"] = base64.b64decode(arguments[-1].split()[-1]).decode("utf-16-le")
+if command == "install.sh":
+    record["bundle"] = os.environ.get("ZED_BUNDLE_PATH")
+with open(os.environ["MOCK_LOG"], "a") as output:
+    output.write(json.dumps(record) + "\n")
+
+if command == "git":
+    print("0123456789abcdef0123456789abcdef01234567")
+elif command == "jq":
+    sys.stdin.read()
+    print("0.999.0")
+elif command == "cargo":
+    if arguments == ["metadata", "--no-deps", "--format-version=1"]:
+        print("{}")
+    elif arguments[:2] == ["xwin", "build"]:
+        build_status = int(os.environ.get("MOCK_BUILD_STATUS", "0"))
+        if build_status:
+            sys.exit(build_status)
+        target = arguments[arguments.index("--target") + 1]
+        target_directory = arguments[arguments.index("--target-dir") + 1]
+        binary = Path(target_directory) / target / "release" / "remote_server.exe"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"mock executable")
+    else:
+        raise SystemExit("Unexpected cargo invocation")
+elif command == "ssh":
+    if "Get-CimInstance" in record["powershell"]:
+        sys.stdout.write(os.environ.get("MOCK_ARCHITECTURE", "x86_64") + "\r\n")
+    elif "Move-Item" in record["powershell"]:
+        sys.exit(int(os.environ.get("MOCK_REPLACE_STATUS", "0")))
+elif command == "scp":
+    sys.exit(int(os.environ.get("MOCK_UPLOAD_STATUS", "0")))
+'''
+
+
+class WindowsRemoteServerInstallerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.directory = Path(self.temporary_directory.name)
+        self.checkout = self.directory / "checkout with spaces"
+        self.script_directory = self.checkout / "script"
+        self.script_directory.mkdir(parents=True)
+        self.channel_file = self.checkout / "crates" / "zed" / "RELEASE_CHANNEL"
+        self.channel_file.parent.mkdir(parents=True)
+        self.channel_file.write_text("dev")
+        for filename in ("install-remote-server-windows", "install-linux", "get-crate-version"):
+            shutil.copy2(CHECKOUT / "script" / filename, self.script_directory / filename)
+
+        self.commands_directory = self.directory / "commands"
+        self.commands_directory.mkdir()
+        mock = self.commands_directory / "mock-command"
+        mock.write_text(f"#!{sys.executable}\n" + MOCK_COMMAND)
+        mock.chmod(0o755)
+        for command in ("cargo-xwin", "cargo", "rustup", "clang", "clang-cl", "lld-link", "llvm-rc", "cmake", "ninja", "git", "jq", "ssh", "scp"):
+            (self.commands_directory / command).symlink_to(mock)
+        for command in ("bash", "dirname", "cat", "iconv", "base64", "tr", "uname", "cut"):
+            executable = shutil.which(command)
+            self.assertIsNotNone(executable, f"Test prerequisite missing: {command}")
+            (self.commands_directory / command).symlink_to(executable)
+        for filename in ("bundle-linux", "install.sh"):
+            (self.script_directory / filename).symlink_to(mock)
+
+        self.log = self.directory / "commands.jsonl"
+        self.environment = os.environ.copy()
+        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_TARGET_DIR", "GITHUB_RUN_NUMBER", "ZED_COMMIT_SHA", "ZED_APP_VERSION", "ZED_RELEASE_CHANNEL"):
+            self.environment.pop(name, None)
+        self.environment.update(PATH=str(self.commands_directory), MOCK_LOG=str(self.log))
+
+    def run_script(self, *arguments, script="install-remote-server-windows", **environment):
+        return subprocess.run(
+            [str(self.script_directory / script), *arguments],
+            cwd=self.directory,
+            env={**self.environment, **environment},
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    def records(self):
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def assert_success(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_help_and_invalid_arguments_do_not_run_commands(self):
+        for script in ("install-remote-server-windows", "install-linux"):
+            self.assert_success(self.run_script("--help", script=script))
+        for arguments in ((), ("--unknown",), ("win11", "extra"), ("",)):
+            self.assertEqual(self.run_script(*arguments).returncode, 2)
+        for arguments in (("--remote-windows",), ("--remote-windows", ""), ("--remote-windows", "-oProxyCommand=bad"), ("--unknown",), ("--remote-windows", "win11", "--remote-windows", "win11")):
+            self.assertEqual(self.run_script(*arguments, script="install-linux").returncode, 2)
+        self.assertEqual(self.records(), [])
+
+    def test_missing_cross_compiler_fails_before_build_or_ssh(self):
+        (self.commands_directory / "cargo-xwin").unlink()
+        result = self.run_script("win11")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cargo install --locked cargo-xwin", result.stderr)
+        self.assertIn("license", result.stderr)
+        self.assertEqual(self.records(), [])
+
+    def test_rustflags_cannot_override_windows_configuration(self):
+        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
+            result = self.run_script("win11", **{name: ""})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unset RUSTFLAGS", result.stderr)
+        self.assertEqual(self.records(), [])
+
+    def test_conflicting_release_channel_fails_before_build_or_ssh(self):
+        result = self.run_script("win11", ZED_RELEASE_CHANNEL="preview")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unset ZED_RELEASE_CHANNEL", result.stderr)
+        self.assertEqual(self.records(), [])
+
+    def test_build_and_upload_preserve_unicode_destination_and_paths(self):
+        destination = "Henrik Ormåsen@192.168.122.205"
+        self.assert_success(self.run_script(destination, CARGO_TARGET_DIR="custom build directory"))
+        records = self.records()
+        build = next(record for record in records if record["command"] == "cargo" and record["arguments"][:2] == ["xwin", "build"])
+        self.assertIn("--locked", build["arguments"])
+        self.assertIn("--release", build["arguments"])
+        self.assertIn("profile.release.package.gpui_windows.debug-assertions=true", build["arguments"])
+        self.assertIn("x86_64-pc-windows-msvc", build["arguments"])
+        self.assertIn(str(self.checkout / "custom build directory"), build["arguments"])
+        uploads = [record for record in records if record["command"] == "scp"]
+        self.assertEqual(len(uploads), 1)
+        self.assertTrue(uploads[0]["arguments"][-1].startswith(destination + ":.zed_server/upload-dev-"))
+        remote_commands = [record for record in records if record["command"] == "ssh"]
+        for record in remote_commands:
+            self.assertEqual(record["arguments"][:2], ["--", destination])
+            self.assertIn("$ErrorActionPreference = 'Stop'", record["powershell"])
+        replacement = remote_commands[-1]["powershell"]
+        self.assertIn(".zed_server/zed-remote-server-dev-build.exe", replacement)
+        self.assertIn(COMMIT, replacement)
+        self.assertLess(replacement.index("$LASTEXITCODE"), replacement.index("Move-Item"))
+        self.assertLess(replacement.index("does not match"), replacement.index("Move-Item"))
+
+    def test_arm64_and_release_channels_match_editor_filenames(self):
+        for channel in ("nightly", "preview", "stable"):
+            with self.subTest(channel=channel):
+                self.channel_file.write_text(channel)
+                self.assert_success(self.run_script("win11", MOCK_ARCHITECTURE="aarch64", GITHUB_RUN_NUMBER="123"))
+                records = self.records()
+                replacement = records[-1]["powershell"]
+                self.assertIn(f"zed-remote-server-{channel}-0.999.0+{channel}.123.{COMMIT}.exe", replacement)
+                expected_version = f"123+{COMMIT}" if channel == "nightly" else "0.999.0"
+                self.assertIn(f"-ne '{expected_version}'", replacement)
+                self.assertTrue(any("aarch64-pc-windows-msvc" in record["arguments"] for record in records))
+
+    def test_unsupported_architecture_fails_before_build(self):
+        result = self.run_script("win11", MOCK_ARCHITECTURE="x86")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected architecture", result.stderr)
+        self.assertEqual([record["command"] for record in self.records()], ["ssh"])
+
+    def test_failed_build_does_not_upload(self):
+        result = self.run_script("win11", MOCK_BUILD_STATUS="7")
+        self.assertEqual(result.returncode, 7)
+        self.assertFalse(any(record["command"] == "scp" for record in self.records()))
+
+    def test_failed_upload_does_not_replace_existing_server(self):
+        result = self.run_script("win11", MOCK_UPLOAD_STATUS="8")
+        self.assertEqual(result.returncode, 8)
+        self.assertFalse(any("Move-Item" in record.get("powershell", "") for record in self.records()))
+
+    def test_remote_verification_or_replacement_failure_is_propagated(self):
+        result = self.run_script("win11", MOCK_REPLACE_STATUS="9")
+        self.assertEqual(result.returncode, 9)
+        self.assertNotIn("Installed win11:", result.stdout)
+
+    def test_install_linux_without_remote_option_is_unchanged(self):
+        self.assert_success(self.run_script(script="install-linux"))
+        commands = [record["command"] for record in self.records()]
+        self.assertEqual(commands, ["bundle-linux", "git", "install.sh"])
+
+    def test_install_linux_builds_remote_server_before_local_install(self):
+        self.assert_success(self.run_script("--remote-windows", "win11", script="install-linux"))
+        commands = [record["command"] for record in self.records()]
+        self.assertLess(commands.index("scp"), commands.index("bundle-linux"))
+        self.assertEqual(commands[-1], "install.sh")
+
+    def test_install_linux_does_not_install_on_remote_failure(self):
+        result = self.run_script("--remote-windows", "win11", script="install-linux", MOCK_BUILD_STATUS="7")
+        self.assertEqual(result.returncode, 7)
+        self.assertFalse(any(record["command"] in ("bundle-linux", "install.sh") for record in self.records()))
+
+
+if __name__ == "__main__":
+    unittest.main()
